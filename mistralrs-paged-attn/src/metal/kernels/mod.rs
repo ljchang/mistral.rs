@@ -3,7 +3,9 @@ use candle_metal_kernels::metal::{
     Buffer, ComputeCommandEncoder, ComputePipeline, ConstantValues, Device, Function, Library,
     Value,
 };
-use objc2_metal::{MTLCompileOptions, MTLDevice, MTLLanguageVersion, MTLMathMode, MTLSize};
+use objc2_metal::{
+    MTLCompileOptions, MTLDevice, MTLGPUFamily, MTLLanguageVersion, MTLMathMode, MTLSize,
+};
 use std::sync::{OnceLock, RwLock};
 use std::{collections::HashMap, ffi::c_void};
 
@@ -16,6 +18,7 @@ use crate::set_params;
 type ComputeCommandEncoderRef = ComputeCommandEncoder;
 type ComputePipelineState = ComputePipeline;
 
+// Metal 3.0 metallib: emulated _MLX_BFloat16, works on ALL Apple Silicon (M1+)
 #[cfg(target_os = "macos")]
 const KERNELS: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
@@ -30,6 +33,23 @@ const KERNELS: &[u8] = include_bytes!(concat!(
 const KERNELS: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/mistralrs_paged_attention_tvos.metallib"
+));
+
+// Metal 3.1 metallib: native bfloat type, optimal on M3+ (Apple GPU Family 9+)
+#[cfg(target_os = "macos")]
+const KERNELS_NATIVE_BF16: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/mistralrs_paged_attention_native_bf16.metallib"
+));
+#[cfg(target_os = "ios")]
+const KERNELS_NATIVE_BF16: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/mistralrs_paged_attention_ios_native_bf16.metallib"
+));
+#[cfg(target_os = "tvos")]
+const KERNELS_NATIVE_BF16: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/mistralrs_paged_attention_tvos_native_bf16.metallib"
 ));
 
 #[derive(thiserror::Error, Debug)]
@@ -73,39 +93,66 @@ impl Kernels {
         Self { pipelines }
     }
 
-    /// Load the library from precompiled metallib, falling back to runtime compilation if needed.
-    /// If this has been previously loaded it will just fetch it from cache.
-    pub fn load_library(&self, device: &Device) -> Result<Library, MetalKernelError> {
-        if let Some(lib) = LIBRARY.get() {
-            Ok(lib.clone())
-        } else {
-            // Try to load precompiled metallib first (faster startup)
-            let lib = if !KERNELS.is_empty() {
-                // Load precompiled metallib directly from embedded bytes via DispatchData.
-                // This avoids writing to a temp file, which can fail in sandboxed
-                // environments (e.g. macOS apps distributed via TestFlight).
-                // https://github.com/EricLBuehler/mistral.rs/issues/1897
-                let data = dispatch2::DispatchData::from_static_bytes(KERNELS);
-
-                let raw_lib = device
-                    .as_ref()
-                    .newLibraryWithData_error(&data)
-                    .map_err(|e| {
-                        MetalKernelError::CompilationError(format!(
-                            "Failed to load precompiled metallib: {e}"
-                        ))
-                    })?;
-                Library::new(raw_lib)
-            } else {
-                // Fall back to runtime compilation if precompiled lib is not available
-                // (e.g., when MISTRALRS_METAL_PRECOMPILE=0)
-                self.compile_kernels_at_runtime(device)?
-            };
-            Ok(LIBRARY.get_or_init(|| lib).clone())
-        }
+    /// Check if the GPU supports native bfloat16 (Apple GPU Family 9+, i.e. M3/A17+).
+    fn gpu_supports_native_bfloat(device: &Device) -> bool {
+        // SAFETY: supportsFamily is a well-defined Metal API query with no side effects.
+        unsafe { device.as_ref().supportsFamily(MTLGPUFamily::Apple9) }
     }
 
-    fn compile_kernels_at_runtime(&self, device: &Device) -> Result<Library, MetalKernelError> {
+    /// Load the library from precompiled metallib, falling back to runtime compilation if needed.
+    /// If this has been previously loaded it will just fetch it from cache.
+    ///
+    /// Selects metallib based on GPU capabilities:
+    /// - M3+ (Apple GPU Family 9+): Metal 3.1 native bfloat for optimal performance
+    /// - M1/M2: Metal 3.0 emulated bfloat for universal compatibility
+    pub fn load_library(&self, device: &Device) -> Result<Library, MetalKernelError> {
+        if let Some(lib) = LIBRARY.get() {
+            return Ok(lib.clone());
+        }
+
+        // Pick metallib based on GPU capabilities
+        let use_native_bf16 =
+            Self::gpu_supports_native_bfloat(device) && !KERNELS_NATIVE_BF16.is_empty();
+        let kernels = if use_native_bf16 {
+            KERNELS_NATIVE_BF16
+        } else {
+            KERNELS
+        };
+
+        let lib = if !kernels.is_empty() {
+            // Load precompiled metallib directly from embedded bytes via DispatchData.
+            // This avoids writing to a temp file, which can fail in sandboxed
+            // environments (e.g. macOS apps distributed via TestFlight).
+            // https://github.com/EricLBuehler/mistral.rs/issues/1897
+            let data = dispatch2::DispatchData::from_static_bytes(kernels);
+
+            let raw_lib = device
+                .as_ref()
+                .newLibraryWithData_error(&data)
+                .map_err(|e| {
+                    MetalKernelError::CompilationError(format!(
+                        "Failed to load precompiled metallib: {e}"
+                    ))
+                })?;
+            Library::new(raw_lib)
+        } else {
+            // Fall back to runtime compilation if precompiled lib is not available
+            // (e.g., when MISTRALRS_METAL_PRECOMPILE=0)
+            let lang = if Self::gpu_supports_native_bfloat(device) {
+                MTLLanguageVersion::Version3_1
+            } else {
+                MTLLanguageVersion::Version3_0
+            };
+            self.compile_kernels_at_runtime(device, lang)?
+        };
+        Ok(LIBRARY.get_or_init(|| lib).clone())
+    }
+
+    fn compile_kernels_at_runtime(
+        &self,
+        device: &Device,
+        language_version: MTLLanguageVersion,
+    ) -> Result<Library, MetalKernelError> {
         use std::collections::{HashMap, HashSet};
 
         // Create a virtual filesystem with all our Metal sources
@@ -267,11 +314,12 @@ impl Kernels {
             }
         }
 
-        // Compile the preprocessed source with Metal 3.1 for native bfloat16 support.
-        // This must match the -std=metal3.1 flag used in build.rs for precompiled metallibs.
+        // Compile with the language version matching the GPU's capabilities:
+        // - Metal 3.0 on M1/M2 (emulated bfloat via _MLX_BFloat16 struct)
+        // - Metal 3.1 on M3+ (native bfloat hardware)
         let compile_options = {
             let opts = MTLCompileOptions::new();
-            opts.setLanguageVersion(MTLLanguageVersion::Version3_1);
+            opts.setLanguageVersion(language_version);
             opts.setMathMode(MTLMathMode::Fast);
             opts
         };

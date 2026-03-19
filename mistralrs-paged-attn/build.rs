@@ -124,11 +124,18 @@ fn main() -> Result<(), String> {
         println!(
             "cargo:warning=Skipping Metal kernel precompilation (MISTRALRS_METAL_PRECOMPILE=0)"
         );
-        // Write a dummy metallib file to satisfy the include_bytes! macro
+        // Write dummy metallib files to satisfy include_bytes! macros
         let out_dir = PathBuf::from(std::env::var("OUT_DIR").map_err(|_| "OUT_DIR not set")?);
-        std::fs::write(out_dir.join("mistralrs_paged_attention.metallib"), []).unwrap();
-        std::fs::write(out_dir.join("mistralrs_paged_attention_ios.metallib"), []).unwrap();
-        std::fs::write(out_dir.join("mistralrs_paged_attention_tvos.metallib"), []).unwrap();
+        for name in [
+            "mistralrs_paged_attention.metallib",
+            "mistralrs_paged_attention_native_bf16.metallib",
+            "mistralrs_paged_attention_ios.metallib",
+            "mistralrs_paged_attention_ios_native_bf16.metallib",
+            "mistralrs_paged_attention_tvos.metallib",
+            "mistralrs_paged_attention_tvos_native_bf16.metallib",
+        ] {
+            std::fs::write(out_dir.join(name), []).unwrap();
+        }
         return Ok(());
     }
 
@@ -147,24 +154,19 @@ fn main() -> Result<(), String> {
             }
         }
 
-        fn metal_std(&self) -> &str {
-            // Use Metal 3.1 unified standard for all platforms.
-            // This enables native bfloat16 support (__HAVE_BFLOAT__) which is
-            // required for PagedAttention kernels with bf16 models (e.g. Qwen3).
-            // Without Metal 3.1, the emulated _MLX_BFloat16 struct is used instead,
-            // which can fail on some Metal compiler/runtime combinations.
-            // https://github.com/EricLBuehler/mistral.rs/issues/1844
-            //
-            // Note: Metal 3.1 MSL compiles on all Apple Silicon. The native bfloat
-            // type is used on M3+ GPUs; older GPUs use the emulated fallback path
-            // in utils.metal, which is still correctly compiled with MSL 3.1.
-            match self {
-                Platform::MacOS | Platform::Ios | Platform::TvOS => "metal3.1",
+        fn metallib_name(&self, suffix: &str) -> String {
+            match (self, suffix) {
+                (Platform::MacOS, "") => "mistralrs_paged_attention.metallib".to_string(),
+                (Platform::Ios, "") => "mistralrs_paged_attention_ios.metallib".to_string(),
+                (Platform::TvOS, "") => "mistralrs_paged_attention_tvos.metallib".to_string(),
+                (Platform::MacOS, s) => format!("mistralrs_paged_attention{s}.metallib"),
+                (Platform::Ios, s) => format!("mistralrs_paged_attention_ios{s}.metallib"),
+                (Platform::TvOS, s) => format!("mistralrs_paged_attention_tvos{s}.metallib"),
             }
         }
     }
 
-    fn compile(platform: Platform) -> Result<(), String> {
+    fn compile(platform: &Platform, metal_std: &str, lib_suffix: &str) -> Result<(), String> {
         let current_dir = env::current_dir().expect("Failed to get current directory");
         let out_dir = PathBuf::from(std::env::var("OUT_DIR").map_err(|_| "OUT_DIR not set")?);
         let working_directory = out_dir.to_string_lossy().to_string();
@@ -176,7 +178,7 @@ fn main() -> Result<(), String> {
             .arg("--sdk")
             .arg(platform.sdk())
             .arg("metal")
-            .arg(format!("-std={}", platform.metal_std()))
+            .arg(format!("-std={metal_std}"))
             .arg(format!("-working-directory={working_directory}"))
             .arg("-Wall")
             .arg("-Wextra")
@@ -188,38 +190,17 @@ fn main() -> Result<(), String> {
         }
         compile_air_cmd.arg(sources.join("utils.metal"));
         compile_air_cmd.arg(sources.join("float8.metal"));
-        compile_air_cmd
+        let status = compile_air_cmd
             .spawn()
             .expect("Failed to compile air")
             .wait()
             .expect("Failed to compile air");
-
-        let mut child = compile_air_cmd.spawn().expect("Failed to compile air");
-
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    panic!("Compiling metal -> air failed. Exit with status: {status}")
-                }
-            }
-            Ok(None) => {
-                let status = child
-                    .wait()
-                    .expect("Compiling metal -> air failed while waiting for result");
-                if !status.success() {
-                    panic!("Compiling metal -> air failed. Exit with status: {status}")
-                }
-            }
-            Err(e) => panic!("Compiling metal -> air failed: {e:?}"),
+        if !status.success() {
+            panic!("Compiling metal -> air failed. Exit with status: {status}")
         }
 
         // Compile air to metallib
-        let lib_name = match platform {
-            Platform::MacOS => "mistralrs_paged_attention.metallib",
-            Platform::Ios => "mistralrs_paged_attention_ios.metallib",
-            Platform::TvOS => "mistralrs_paged_attention_tvos.metallib",
-        };
-        let metallib = out_dir.join(lib_name);
+        let metallib = out_dir.join(platform.metallib_name(lib_suffix));
         let mut compile_metallib_cmd = Command::new("xcrun");
         compile_metallib_cmd.arg("metal").arg("-o").arg(&metallib);
 
@@ -229,33 +210,29 @@ fn main() -> Result<(), String> {
         compile_metallib_cmd.arg(out_dir.join("utils.air"));
         compile_metallib_cmd.arg(out_dir.join("float8.air"));
 
-        let mut child = compile_metallib_cmd
+        let status = compile_metallib_cmd
             .spawn()
+            .expect("Failed to compile air -> metallib")
+            .wait()
             .expect("Failed to compile air -> metallib");
-
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    panic!("Compiling air -> metallib failed. Exit with status: {status}")
-                }
-            }
-            Ok(None) => {
-                let status = child
-                    .wait()
-                    .expect("Compiling air -> metallib failed while waiting for result");
-                if !status.success() {
-                    panic!("Compiling air -> metallib failed. Exit with status: {status}")
-                }
-            }
-            Err(e) => panic!("Compiling air -> metallib failed: {e:?}"),
+        if !status.success() {
+            panic!("Compiling air -> metallib failed. Exit with status: {status}")
         }
 
         Ok(())
     }
 
-    compile(Platform::MacOS)?;
-    compile(Platform::Ios)?;
-    compile(Platform::TvOS)?;
+    // Compile two metallibs per platform:
+    // - Metal 3.0: emulated _MLX_BFloat16 struct, works on ALL Apple Silicon (M1+)
+    // - Metal 3.1: native bfloat type, optimal on M3+ (Apple GPU Family 9+)
+    //
+    // Metal 3.1 defines __HAVE_BFLOAT__ which makes the shader use native bfloat
+    // operations. These fail at runtime JIT on M1/M2 GPUs which lack native bfloat
+    // hardware. The Metal 3.0 build uses the emulated path that works everywhere.
+    for platform in &[Platform::MacOS, Platform::Ios, Platform::TvOS] {
+        compile(platform, "metal3.0", "")?;
+        compile(platform, "metal3.1", "_native_bf16")?;
+    }
 
     Ok(())
 }
