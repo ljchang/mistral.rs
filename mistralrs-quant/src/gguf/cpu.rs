@@ -27,19 +27,41 @@ pub fn qtensor_indexed_moe_forward(
 ) -> Result<Tensor> {
     let device = x.device();
 
-    // Dequantize on CPU to avoid Metal buffer allocation failure for large
-    // fused MoE tensors (e.g. [128, N, K] at f32 can exceed Metal's buffer limit).
-    // The subsequent gather_forward selects only the active experts (typically 8),
-    // so the actual computation is small.
-    let weights = qtensor.dequantize(&candle_core::Device::Cpu)?;
-    let x_cpu = x.to_device(&candle_core::Device::Cpu)?;
-    let ids_cpu = ids.to_device(&candle_core::Device::Cpu)?;
+    // Dequantize the full expert tensor on CPU to avoid Metal buffer allocation
+    // failure (e.g. [128, N, K] at f32 can exceed Metal's single buffer limit).
+    let all_weights = qtensor.dequantize(&candle_core::Device::Cpu)?;
+    let (_num_experts, out_features, _in_features) = all_weights.dims3()?;
 
-    let unquant = UnquantLinear::new(QuantMethodConfig::Unquantized(Linear::new(weights, None)))?;
-    let result = unquant.gather_forward(&x_cpu, &ids_cpu)?;
+    // Input is 3D: either [n, 1, h] (gate/up) or [n, k, h] (down, already per-expert)
+    // ids is 2D: [n, k] where k = num_experts_per_tok
+    let (num_tokens, num_experts_per_tok) = ids.dims2()?;
+    let (_, x_mid, hidden_dim) = x.dims3()?;
 
-    // Move result back to the original device (Metal)
-    result.to_device(device)
+    // Select only the active expert weights on CPU (e.g. 8 of 128 → tiny tensor)
+    let flat_ids = ids.flatten_all()?.to_device(&candle_core::Device::Cpu)?;
+    let selected_w = all_weights.index_select(&flat_ids, 0)?;
+    drop(all_weights); // free the large CPU buffer
+
+    // Move the small selected weights to the compute device (Metal)
+    let selected_w = selected_w.to_device(device)?;
+
+    // Expand input to [n*k, h]:
+    //   [n, 1, h] → broadcast to [n, k, h] → reshape [n*k, h]
+    //   [n, k, h] → reshape [n*k, h] directly
+    let a_expanded = if x_mid == 1 {
+        x.broadcast_as((num_tokens, num_experts_per_tok, hidden_dim))?
+            .reshape((num_tokens * num_experts_per_tok, hidden_dim))?
+    } else {
+        x.reshape((num_tokens * num_experts_per_tok, hidden_dim))?
+    };
+
+    // Matmul on device: [n*k, 1, h] @ [n*k, h, out] → [n*k, out]
+    let result = a_expanded
+        .unsqueeze(1)?
+        .matmul(&selected_w.transpose(1, 2)?)?
+        .squeeze(1)?;
+
+    result.reshape((num_tokens, num_experts_per_tok, out_features))
 }
 
 /// Perform indexed MoE forward pass on a QMatMul.
