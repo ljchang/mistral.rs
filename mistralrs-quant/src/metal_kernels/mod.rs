@@ -54,6 +54,7 @@ impl<T> From<std::sync::PoisonError<T>> for MetalKernelError {
 type Pipelines = HashMap<String, ComputePipeline>;
 
 static LIBRARY: OnceLock<Library> = OnceLock::new();
+static RUNTIME_LIBRARY: OnceLock<Library> = OnceLock::new();
 
 #[derive(Debug)]
 pub struct Kernels {
@@ -300,17 +301,40 @@ impl Kernels {
             })
     }
 
+    /// Load the runtime-compiled library, compiling once on first call.
+    /// Used as a fallback when the precompiled metallib can't load a function
+    /// (e.g., Metal standard version mismatch between build-time and runtime GPU).
+    fn load_runtime_library(&self, device: &Device) -> Result<Library, MetalKernelError> {
+        if let Some(lib) = RUNTIME_LIBRARY.get() {
+            return Ok(lib.clone());
+        }
+        eprintln!("[mistralrs-quant] Compiling Metal kernels at runtime (precompiled metallib function load failed)");
+        let lib = self.compile_kernels_at_runtime(device)?;
+        Ok(RUNTIME_LIBRARY.get_or_init(|| lib).clone())
+    }
+
     fn load_function(
         &self,
         device: &Device,
         name: impl ToString,
         constants: Option<&ConstantValues>,
     ) -> Result<Function, MetalKernelError> {
-        let func = self
-            .load_library(device)?
-            .get_function(&name.to_string(), constants)
-            .map_err(|e| MetalKernelError::LoadFunctionError(e.to_string()))?;
-        Ok(func)
+        let name_str = name.to_string();
+        let lib = self.load_library(device)?;
+        match lib.get_function(&name_str, constants) {
+            Ok(func) => Ok(func),
+            Err(precompiled_err) => {
+                // Precompiled metallib function failed — fall back to runtime compilation.
+                // This handles Metal standard version mismatches between build-time
+                // (e.g. metal3.1) and the runtime GPU (e.g. Metal 4 on M5).
+                let rt_lib = self.load_runtime_library(device)?;
+                rt_lib.get_function(&name_str, constants).map_err(|e| {
+                    MetalKernelError::LoadFunctionError(format!(
+                        "precompiled: {precompiled_err}, runtime: {e}"
+                    ))
+                })
+            }
+        }
     }
 
     /// Load the give pipeline
