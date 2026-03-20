@@ -27,13 +27,19 @@ pub fn qtensor_indexed_moe_forward(
 ) -> Result<Tensor> {
     let device = x.device();
 
-    // Dequantize all weights to f32
-    let weights = qtensor.dequantize(device)?;
+    // Dequantize on CPU to avoid Metal buffer allocation failure for large
+    // fused MoE tensors (e.g. [128, N, K] at f32 can exceed Metal's buffer limit).
+    // The subsequent gather_forward selects only the active experts (typically 8),
+    // so the actual computation is small.
+    let weights = qtensor.dequantize(&candle_core::Device::Cpu)?;
+    let x_cpu = x.to_device(&candle_core::Device::Cpu)?;
+    let ids_cpu = ids.to_device(&candle_core::Device::Cpu)?;
 
-    // Create an UnquantLinear and use its gather_forward
     let unquant = UnquantLinear::new(QuantMethodConfig::Unquantized(Linear::new(weights, None)))?;
+    let result = unquant.gather_forward(&x_cpu, &ids_cpu)?;
 
-    unquant.gather_forward(x, ids)
+    // Move result back to the original device (Metal)
+    result.to_device(device)
 }
 
 /// Perform indexed MoE forward pass on a QMatMul.
