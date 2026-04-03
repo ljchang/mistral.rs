@@ -225,10 +225,15 @@ impl MoEExperts {
                         cfg, experts_vb,
                     )?)
                 } else {
-                    candle_core::bail!(
-                        "new_direct Fast backend requires combined stacked format \
-                         (gate_up_proj) or use new() with standard VB paths"
-                    )
+                    // Fall back to Slow backend for per-expert format on Metal/CUDA.
+                    // The Fast backend only handles combined stacked (gate_up_proj),
+                    // but UQFF models may store weights in per-expert layout.
+                    MoEExpertsBackendImpl::Slow(Self::load_slow(
+                        cfg,
+                        experts_vb,
+                        comm,
+                        quantization_config,
+                    )?)
                 }
             }
             MoEExpertsBackend::Slow => {
