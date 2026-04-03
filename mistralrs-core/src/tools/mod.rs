@@ -119,16 +119,30 @@ fn escape_inner_quotes(input: &str) -> String {
 /// Input:  `key1:<|"|>value<|"|>,key2:42,nested:{k:<|"|>v<|"|>}`
 /// Output: `{"key1":"value","key2":42,"nested":{"k":"v"}}`
 fn gemma4_args_to_json(raw: &str) -> std::result::Result<Value, candle_core::Error> {
-    // Step 1: wrap in braces so it's a full object
     let with_braces = format!("{{{raw}}}");
 
-    // Step 1b: escape literal `"` chars inside delimited strings
+    // Fast path: if the model output standard JSON (no <|"|> delimiters),
+    // try parsing directly. Quantized models sometimes use \" escaping or
+    // plain "quotes" instead of <|"|> delimiters.
+    if !with_braces.contains(GEMMA4_STR_DELIM) {
+        // Strip stray backslash-quote sequences that appear outside strings
+        // (e.g. [\"value\"] → ["value"]) — common with quantized models.
+        let cleaned = with_braces.replace("\\\"", "\"");
+        let json_str = quote_unquoted_keys(&cleaned);
+        if let Ok(val) = serde_json::from_str::<Value>(&json_str) {
+            return Ok(val);
+        }
+        // Also try the original (without backslash stripping) in case
+        // the backslashes were intentional escape sequences inside strings.
+        let json_str = quote_unquoted_keys(&with_braces);
+        if let Ok(val) = serde_json::from_str::<Value>(&json_str) {
+            return Ok(val);
+        }
+    }
+
+    // Standard path: convert <|"|> delimiters to quotes
     let with_braces = escape_inner_quotes(&with_braces);
-
-    // Step 2: replace <|"|> with "
     let with_quotes = with_braces.replace(GEMMA4_STR_DELIM, "\"");
-
-    // Step 3: quote unquoted keys using a state machine
     let json_str = quote_unquoted_keys(&with_quotes);
 
     serde_json::from_str(&json_str).map_err(|e| {
